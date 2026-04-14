@@ -12,8 +12,8 @@ async def fast_upload(client, file_path, workers=4, progress_callback=None):
     Parallel upload for Telethon. Optimized for cloud environments with high latency.
     """
     file_size = os.path.getsize(file_path)
-    # Larger chunks for better network efficiency
-    chunk_size = 512 * 1024 if file_size <= 10 * 1024 * 1024 else 1024 * 1024
+    # 512KB is the safest chunk size to avoid payload limit errors
+    chunk_size = 512 * 1024 
     total_chunks = math.ceil(file_size / chunk_size)
     is_big = file_size > 10 * 1024 * 1024
     file_id = random.getrandbits(63)

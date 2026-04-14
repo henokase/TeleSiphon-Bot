@@ -288,7 +288,15 @@ async def start_siphon_process(event, state):
 
         async for message in client.iter_messages(source_entity, filter=msg_filter, limit=state.limit):
             if message.media:
+                last_update = 0
                 async def progress(current, total):
+                    nonlocal last_update
+                    import time
+                    now = time.time()
+                    if now - last_update < 1.0 and current < total:
+                        return
+                    last_update = now
+                    
                     bar = get_progress_bar(current, total)
                     try: await status_msg.edit(f"{current_header}\n`{bar}`")
                     except: pass
