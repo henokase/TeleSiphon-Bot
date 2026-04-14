@@ -1,0 +1,6 @@
+telethon
+python-dotenv
+tqdm
+cryptg
+fastapi
+uvicorn
