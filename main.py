@@ -294,22 +294,46 @@ async def start_siphon_process(event, state):
                     except: pass
 
                 local_path = await downloader.download_media_with_progress(message, progress_callback=progress)
+                
                 if local_path:
                     try:
-                        await status_msg.edit(f"📤 **Mirroring...**\n`{os.path.basename(local_path)}`")
-                        is_voice = message.audio and any(getattr(a, 'voice', False) for a in message.media.document.attributes if isinstance(a, DocumentAttributeAudio))
+                        from telethon_utils import fast_upload
+                        
+                        # 2. Parallel Upload (Pre-stage in cloud)
+                        current_header = f"📤 **Uploading {category}...**"
+                        await status_msg.edit(current_header)
+                        
+                        uploaded_file = await fast_upload(
+                            client, 
+                            local_path, 
+                            workers=4, # Safe for 0.1 CPU
+                            progress_callback=progress
+                        )
+                        
+                        # 3. Mirroring to Target
+                        await status_msg.edit(f"🛰 **Finalizing Mirror...**\n`{os.path.basename(local_path)}`")
+                        
+                        is_voice = message.audio and any(
+                            getattr(a, 'voice', False) 
+                            for a in message.media.document.attributes 
+                            if isinstance(a, DocumentAttributeAudio)
+                        )
+
                         await client.send_file(
                             dest_entity,
-                            local_path,
+                            uploaded_file,
                             caption=message.message,
                             formatting_entities=message.entities,
                             voice_note=is_voice,
                             attributes=message.media.document.attributes if hasattr(message.media, 'document') else None,
                             supports_streaming=True if category == "Videos" else False
                         )
-                    except Exception as upload_err: print(f"Upload error: {upload_err}")
+                    except Exception as upload_err:
+                        print(f"Upload error: {upload_err}")
                     finally:
-                        if os.path.exists(local_path): os.remove(local_path)
+                        # 4. Cleanup
+                        if os.path.exists(local_path):
+                            os.remove(local_path)
                 
                 total_processed += 1
                 await asyncio.sleep(1.5)
