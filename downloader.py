@@ -1,12 +1,12 @@
 import os
-from tqdm import tqdm
+import re
 from telethon import utils
 
 
 class DownloadManager:
     """
-    Manages the download process for Telegram media with progress tracking
-     and file verification.
+    Manages the download process for Telegram media with flexible progress tracking
+    and cloud-native storage support.
     """
 
     def __init__(self, client):
@@ -18,13 +18,14 @@ class DownloadManager:
         """
         self.client = client
 
-    async def download_media_with_progress(self, message, download_dir="downloads"):
+    async def download_media_with_progress(self, message, download_dir="/tmp", progress_callback=None):
         """
-        Downloads media from a Telegram message with a visible progress bar.
+        Downloads media from a Telegram message with an optional progress callback.
 
         Args:
             message (Message): The Telethon message object containing media.
-            download_dir (str): The local directory to save the file in.
+            download_dir (str): The local directory to save the file in. Defaults to /tmp for cloud.
+            progress_callback (callable): A function to call with (current, total) bytes.
 
         Returns:
             str: The local path to the downloaded file, or None if failed.
@@ -39,25 +40,8 @@ class DownloadManager:
         filename = self.get_safe_filename(message)
         file_path = os.path.join(download_dir, filename)
 
-        # Skip logic: If file already exists, don't download it again
-        if os.path.exists(file_path):
-            print(f"Skipping existing file: {filename}")
-            return file_path
-
-        # Remote size for verification and progress bar
+        # Remote size for verification
         remote_size = self._get_remote_size(message)
-
-        # tqdm progress bar setup
-        pbar = tqdm(
-            total=remote_size,
-            unit='B',
-            unit_scale=True,
-            desc=f"Downloading {filename}",
-            leave=False
-        )
-
-        def progress_callback(current, total):
-            pbar.update(current - pbar.n)
 
         try:
             # The actual download
@@ -66,78 +50,65 @@ class DownloadManager:
                 file=file_path,
                 progress_callback=progress_callback
             )
-            pbar.close()
 
             if path:
                 # Verification
                 if self.verify_file_integrity(path, remote_size):
-                    print(f"\n[SUCCESS] Downloaded and verified: {path}")
                     return path
                 else:
-                    print(f"\n[ERROR] Verification failed for: {path}")
+                    print(f"[ERROR] Verification failed for: {path}")
+                    if os.path.exists(path):
+                        os.remove(path)
                     return None
             else:
-                pbar.close()
-                print(f"\n[ERROR] Download failed for message {message.id}")
                 return None
 
         except Exception as e:
-            pbar.close()
-            print(f"\n[EXCEPTION] Error downloading message {message.id}: {e}")
+            print(f"[EXCEPTION] Error downloading message {message.id}: {e}")
+            if os.path.exists(file_path):
+                os.remove(file_path)
             return None
 
     def get_safe_filename(self, message):
         """
-        Generates a unique filename based on original filename and timestamp.
-        Convention: [original_name]_[msg_id]_[timestamp].[ext]
-
-        Args:
-            message (Message): The Telethon message object.
-
-        Returns:
-            str: A safe, unique filename.
+        Generates a unique filename while preserving correct extensions for all media.
         """
-        # Get timestamp
+        from telethon.tl.types import DocumentAttributeAudio
+        
         timestamp = message.date.strftime("%Y%m%d_%H%M%S")
-
-        # Try to get existing filename and extension
         original_name = None
-        extension = ""
+        
+        # 1. Always get the correct extension first
+        extension = ".bin"
+        if message.file and message.file.ext:
+            extension = message.file.ext
+        
+        # 2. Try Audio Metadata (Performer - Title)
+        if message.audio or message.voice:
+            attr = next((a for a in message.media.document.attributes if isinstance(a, DocumentAttributeAudio)), None)
+            if attr:
+                parts = []
+                if attr.performer: parts.append(attr.performer)
+                if attr.title: parts.append(attr.title)
+                if parts:
+                    original_name = " - ".join(parts)
 
-        if message.file:
-            if message.file.name:
-                original_name, extension = os.path.splitext(message.file.name)
-            else:
-                extension = message.file.ext or ""
+        # 3. Fallback to original filename
+        if not original_name and message.file and message.file.name:
+            original_name, _ = os.path.splitext(message.file.name)
 
+        # 4. Fallback to type-based naming
         if not original_name:
-            # Fallback based on media type
-            if message.voice:
-                original_name = "voice_note"
-                if not extension:
-                    extension = ".ogg"
-            elif message.audio:
-                original_name = "audio"
-                if not extension:
-                    extension = ".mp3"
-            elif message.video:
-                original_name = "video"
-                if not extension:
-                    extension = ".mp4"
-            elif message.photo:
-                original_name = "photo"
-                if not extension:
-                    extension = ".jpg"
-            else:
-                original_name = "media_file"
-                if not extension:
-                    extension = ".bin"
+            if message.voice: original_name = "voice_note"
+            elif message.audio: original_name = "audio"
+            elif message.video: original_name = "video"
+            elif message.photo: original_name = "photo"
+            else: original_name = "media_file"
 
-        # Clean the extension (ensure it starts with a dot)
-        if extension and not extension.startswith('.'):
-            extension = f".{extension}"
+        # SANITIZATION
+        original_name = re.sub(r'[\\/*?:"<>|]', "", original_name)
+        original_name = original_name.replace(";", "_").strip()
 
-        # Combine into requested format: [name]_[id]_[timestamp].[ext]
         return f"{original_name}_{message.id}_{timestamp}{extension}"
 
     def _get_remote_size(self, message):

@@ -1,50 +1,47 @@
-# TeleSiphon
+# TeleSiphon (Cloud-Native UserBot)
 
-**TeleSiphon** is a Python-based utility to download and forward media from restricted Telegram groups using the MTProto API.
+**TeleSiphon** is an interactive Telegram UserBot designed to mirror media from restricted groups to a destination chat.
 
-## Features
+## 🚀 Features
 
-- **Bypass Restrictions**: Directly interfaces with MTProto to download media from groups where "Restrict Saving Content" is enabled.
-- **Forwarding (Re-upload)**: Bypasses forwarding restrictions by downloading the file and re-uploading it as a brand-new message.
-- **Rich Text Preservation**: Maintains bold, italics, and links in captions when forwarding.
-- **Interactive Menu**: Choose between downloading, forwarding, and specific media types (Voices, Audios, Videos, Images).
-- **Progress Tracking**: Real-time console progress bars using `tqdm`.
-- **Integrity Verification**: Verifies downloaded file sizes against Telegram metadata.
+- **Siphon-Mirror Workflow**: Fetches restricted media, caches it temporarily, re-uploads it, and cleans up immediately.
+- **Bypass Restrictions**: Directly interfaces with MTProto to bypass "Restrict Saving Content" settings.
+- **Rich Text Preservation**: Maintains bold, italics, and links in captions.
+- **Interactive Buttons**: Manage everything via Telegram Inline Keyboards.
+- **Cloud-Ready**: 
+    - **String Session**: No local `.session` file needed.
+    - **Keep-Alive**: Built-in FastAPI server for Render health checks.
+    - **Ephemeral Storage**: Uses `/tmp/` for processing.
+- **Real-time Progress**: Displays a live progress bar by editing its own status message.
 
-## Setup
+## 🛠 Setup
 
-1.  **Clone the Repository**:
+1.  **Dependencies**:
     ```bash
-    git clone https://github.com/yourusername/TeleSiphon.git
-    cd TeleSiphon
-    ```
-
-2.  **Install Dependencies**:
-    ```bash
-    python -m venv venv
-    .\venv\Scripts\activate  # Windows
     pip install -r requirements.txt
     ```
-
-3.  **Configure `.env`**:
-    Create a `.env` file in the root directory:
+2.  **Environment Variables (`.env`)**:
     ```env
-    API_ID=your_api_id
-    API_HASH=your_api_hash
-    TARGET_CHAT_ID=source_group_id
-    FORWARD_CHAT_ID=destination_group_id
-    DOWNLOAD_LIMIT=0  # 0 for no limit
+    API_ID=your_id
+    API_HASH=your_hash
+    TELEGRAM_STRING_SESSION=your_string_session
+    DEFAULT_SOURCE=source_chat_id
+    DEFAULT_DESTINATION=destination_chat_id
+    PORT=8000
+    ```
+3. **Start Command**:
+    ```bash
+    python app.py
     ```
 
-## Usage
+## 🕹 Usage
 
-Simply run:
-```bash
-python main.py
-```
+1.  Send `.siphon` in any chat where the UserBot is active.
+2.  Use the **Control Panel** to:
+    - Confirm or change your Source/Destination.
+    - Select Media Types (Voices, Videos, etc.).
+    - Select the search limit.
+3.  Watch the progress bar as TeleSiphon mirrors the content.
 
-Follow the interactive prompts to select your source chat, action, and media types.
-
-## Disclaimer
-
-This tool is for educational purposes only. Always respect Telegram's Terms of Service and the privacy of group members.
+## ⚠️ Disclaimer
+This tool is for educational purposes only. Always respect Telegram's Terms of Service and user privacy.
