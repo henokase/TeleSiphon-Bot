@@ -1,89 +1,97 @@
+"""
+TeleSiphon Download Manager
+--------------------------
+Handles the authenticated retrieval of media from Telegram's MTProto servers.
+Includes support for cloud-native ephemeral storage (/tmp), safe filename 
+sanitization using media metadata, and post-download integrity verification.
+"""
+
 import os
 import re
 from telethon import utils
 
-
 class DownloadManager:
     """
-    Manages the download process for Telegram media with flexible progress tracking
-    and cloud-native storage support.
+    Manages the lifecycle of media downloads including path resolution,
+    metadata extraction for naming, and integrity checks.
     """
 
     def __init__(self, client):
         """
-        Initializes the DownloadManager.
+        Initializes the manager with an active Telethon client.
 
         Args:
-            client (TelegramClient): The authenticated Telethon client.
+            client (TelegramClient): Authenticated Telethon session.
         """
         self.client = client
 
     async def download_media_with_progress(self, message, download_dir="/tmp", progress_callback=None):
         """
-        Downloads media from a Telegram message with an optional progress callback.
+        Downloads media with real-time progress updates and integrity validation.
 
         Args:
-            message (Message): The Telethon message object containing media.
-            download_dir (str): The local directory to save the file in. Defaults to /tmp for cloud.
-            progress_callback (callable): A function to call with (current, total) bytes.
+            message (Message): Telethon message object containing media.
+            download_dir (str): Local directory for temporary storage.
+            progress_callback (callable): Optional async/sync function for progress tracking.
 
         Returns:
-            str: The local path to the downloaded file, or None if failed.
+            str: Absolute path to the verified local file, or None on failure.
         """
         if not message.media:
             return None
 
-        # Create download directory if it doesn't exist
         os.makedirs(download_dir, exist_ok=True)
 
-        # Generate a safe filename
+        # Generate unique and descriptive filename
         filename = self.get_safe_filename(message)
         file_path = os.path.join(download_dir, filename)
 
-        # Remote size for verification
+        # Retrieve remote size for post-download verification
         remote_size = self._get_remote_size(message)
 
         try:
-            # The actual download
-            path = await self.client.download_media(
+            downloaded_path = await self.client.download_media(
                 message,
                 file=file_path,
                 progress_callback=progress_callback
             )
 
-            if path:
-                # Verification
-                if self.verify_file_integrity(path, remote_size):
-                    return path
-                else:
-                    print(f"[ERROR] Verification failed for: {path}")
-                    if os.path.exists(path):
-                        os.remove(path)
-                    return None
-            else:
-                return None
+            if downloaded_path:
+                if self.verify_file_integrity(downloaded_path, remote_size):
+                    return downloaded_path
+                
+                print(f"[ERROR] Integrity verification failed: {downloaded_path}")
+                if os.path.exists(downloaded_path):
+                    os.remove(downloaded_path)
+            
+            return None
 
         except Exception as e:
-            print(f"[EXCEPTION] Error downloading message {message.id}: {e}")
+            print(f"[ERROR] Download failure for message {message.id}: {e}")
             if os.path.exists(file_path):
                 os.remove(file_path)
             return None
 
-    def get_safe_filename(self, message):
+    def get_safe_filename(self, message) -> str:
         """
-        Generates a unique filename while preserving correct extensions for all media.
+        Generates a sanitized filename by prioritizing media metadata (Audio Title/Performer)
+        or original filenames, falling back to type-based names.
+
+        Args:
+            message (Message): Telethon message object.
+
+        Returns:
+            str: Sanitized filename with correct extension.
         """
         from telethon.tl.types import DocumentAttributeAudio
         
         timestamp = message.date.strftime("%Y%m%d_%H%M%S")
-        original_name = None
+        candidate_name = None
         
-        # 1. Always get the correct extension first
-        extension = ".bin"
-        if message.file and message.file.ext:
-            extension = message.file.ext
+        # Determine appropriate file extension
+        extension = message.file.ext if (message.file and message.file.ext) else ".bin"
         
-        # 2. Try Audio Metadata (Performer - Title)
+        # Strategy A: Extract Audio Metadata
         if message.audio or message.voice:
             attr = next((a for a in message.media.document.attributes if isinstance(a, DocumentAttributeAudio)), None)
             if attr:
@@ -91,52 +99,32 @@ class DownloadManager:
                 if attr.performer: parts.append(attr.performer)
                 if attr.title: parts.append(attr.title)
                 if parts:
-                    original_name = " - ".join(parts)
+                    candidate_name = " - ".join(parts)
 
-        # 3. Fallback to original filename
-        if not original_name and message.file and message.file.name:
-            original_name, _ = os.path.splitext(message.file.name)
+        # Strategy B: Original Filename
+        if not candidate_name and message.file and message.file.name:
+            candidate_name, _ = os.path.splitext(message.file.name)
 
-        # 4. Fallback to type-based naming
-        if not original_name:
-            if message.voice: original_name = "voice_note"
-            elif message.audio: original_name = "audio"
-            elif message.video: original_name = "video"
-            elif message.photo: original_name = "photo"
-            else: original_name = "media_file"
+        # Strategy C: Type-based Generic Name
+        if not candidate_name:
+            if message.voice: candidate_name = "voice_note"
+            elif message.audio: candidate_name = "audio"
+            elif message.video: candidate_name = "video"
+            elif message.photo: candidate_name = "photo"
+            else: candidate_name = "media_file"
 
-        # SANITIZATION
-        original_name = re.sub(r'[\\/*?:"<>|]', "", original_name)
-        original_name = original_name.replace(";", "_").strip()
+        # Production-grade sanitization
+        candidate_name = re.sub(r'[\\/*?:"<>|]', "", candidate_name)
+        candidate_name = candidate_name.replace(";", "_").strip()
 
-        return f"{original_name}_{message.id}_{timestamp}{extension}"
+        return f"{candidate_name}_{message.id}_{timestamp}{extension}"
 
-    def _get_remote_size(self, message):
-        """
-        Extracts the file size from the media object.
+    def _get_remote_size(self, message) -> int:
+        """Helper to extract remote file size in bytes."""
+        return message.file.size if message.file else 0
 
-        Args:
-            message (Message): The Telethon message object.
-
-        Returns:
-            int: The size of the file in bytes.
-        """
-        if message.file:
-            return message.file.size
-        return 0
-
-    def verify_file_integrity(self, file_path, remote_size):
-        """
-        Compares local file size with remote size.
-
-        Args:
-            file_path (str): Path to the local file.
-            remote_size (int): Expected size in bytes.
-
-        Returns:
-            bool: True if sizes match, False otherwise.
-        """
+    def verify_file_integrity(self, file_path: str, remote_size: int) -> bool:
+        """Verifies that the downloaded file size matches the remote specification."""
         if not os.path.exists(file_path):
             return False
-        local_size = os.path.getsize(file_path)
-        return local_size == remote_size
+        return os.path.getsize(file_path) == remote_size
