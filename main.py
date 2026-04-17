@@ -9,6 +9,7 @@ from telethon.tl.types import (
     InputMessagesFilterPhotos,
     DocumentAttributeAudio
 )
+from telethon.tl.functions.messages import GetForumTopicsRequest
 from downloader import DownloadManager
 from bot_client import client
 
@@ -34,7 +35,11 @@ class SiphonState:
 
         self.limit = DOWNLOAD_LIMIT_ENV or 5
         self.media_type = "All"
-        self.waiting_for = None  # 'init', 'setup_source', 'setup_dest', 'media', 'limit', 'source_input', 'dest_input'
+        self.waiting_for = None  # 'init', 'setup_source', 'setup_dest', 'media', 'limit', 'source_input', 'dest_input', 'source_type', 'topic_selection'
+        self.source_type = 'group' # 'group' or 'topic'
+        self.topic_id = None
+        self.available_topics = {} # Mapping index -> topic_id
+        
         self.interaction_chat_id = chat_id
         self.interaction_msg_ids = []  # IDs of all bot messages to delete later
         self.summary_msg_id = None    # Special ID for the "Done" message to keep during reset
@@ -130,10 +135,11 @@ async def unified_input_handler(event):
                 m = await event.respond("⚠️ Source and Destination must be set first!")
                 await register_msg(state, m)
                 return
-            await show_media_menu(event, state)
+            await proceed_to_media_or_topic(event, state)
         elif inp == "2":
             await show_source_setup(event, state)
         elif inp == "3":
+            # ... exit logic ...
             m = await event.respond("👋 Exiting TeleSiphon...")
             await register_msg(state, m)
             await asyncio.sleep(1)
@@ -166,20 +172,40 @@ async def unified_input_handler(event):
             await show_dest_setup(event, state)
         return
 
-    # 4. Destination Setup Branch
-    if state.waiting_for == 'setup_dest':
+    # 4. Source Type Selection (Forum Only)
+    if state.waiting_for == 'source_type':
         if inp == "1":
+            state.source_type = 'group'
+            state.topic_id = None
             await show_media_menu(event, state)
         elif inp == "2":
-            state.destination = state.interaction_chat_id
+            await show_topic_selection(event, state)
+        return
+
+    # 5. Topic Selection
+    if state.waiting_for == 'topic_selection':
+        if inp in state.available_topics:
+            state.source_type = 'topic'
+            state.topic_id = state.available_topics[inp]
             await show_media_menu(event, state)
+        elif inp == "0": # Back to source type
+            await show_source_type_menu(event, state)
+        return
+
+    # 6. Destination Setup Branch
+    if state.waiting_for == 'setup_dest':
+        if inp == "1":
+            await proceed_to_media_or_topic(event, state)
+        elif inp == "2":
+            state.destination = state.interaction_chat_id
+            await proceed_to_media_or_topic(event, state)
         elif inp == "3":
             state.waiting_for = 'dest_input'
             m = await event.respond("👉 **Forward a message** from destination, or paste ID/Username.")
             await register_msg(state, m)
         return
 
-    # 5. Destination Input Logic
+    # 7. Destination Input Logic
     if state.waiting_for == 'dest_input':
         target = None
         if event.fwd_from:
@@ -191,10 +217,10 @@ async def unified_input_handler(event):
         
         if target:
             state.destination = target
-            await show_media_menu(event, state)
+            await proceed_to_media_or_topic(event, state)
         return
 
-    # 6. Media Selection
+    # 8. Media Selection
     if state.waiting_for == 'media':
         media_map = {"1": "Voices", "2": "Audios", "3": "Videos", "4": "Photos", "5": "All"}
         if inp in media_map:
@@ -202,7 +228,7 @@ async def unified_input_handler(event):
             await show_limit_menu(event, state)
         return
 
-    # 7. Limit Selection
+    # 9. Limit Selection
     if state.waiting_for == 'limit':
         limit_map = {"A": 5, "B": 10, "C": 50, "D": 100}
         if inp_upper in limit_map:
@@ -212,6 +238,77 @@ async def unified_input_handler(event):
             state.limit = int(inp)
             await start_siphon_process(event, state)
         return
+
+async def proceed_to_media_or_topic(event, state):
+    """Centralized logic to check if source is a forum before showing media menu."""
+    try:
+        status = await event.respond("🔍 **Checking source features...**")
+        await register_msg(state, status)
+        
+        entity = await client.get_entity(state.source)
+        is_forum = getattr(entity, 'forum', False)
+        
+        await client.delete_messages(state.interaction_chat_id, [status.id])
+        if status.id in state.interaction_msg_ids:
+            state.interaction_msg_ids.remove(status.id)
+
+        if is_forum:
+            await show_source_type_menu(event, state)
+        else:
+            state.source_type = 'group'
+            state.topic_id = None
+            await show_media_menu(event, state)
+    except Exception as e:
+        print(f"Forum check error: {e}")
+        await show_media_menu(event, state)
+
+async def show_source_type_menu(event, state):
+    state.waiting_for = 'source_type'
+    text = (
+        "**📚 Forum Detected!**\n\n"
+        "How would you like to siphon?\n"
+        "1️⃣ Whole Group (Everything)\n"
+        "2️⃣ Specific Topic"
+    )
+    msg = await event.respond(text)
+    await register_msg(state, msg)
+
+async def show_topic_selection(event, state):
+    state.waiting_for = 'topic_selection'
+    
+    status = await event.respond("🔍 **Fetching topics...**")
+    await register_msg(state, status)
+    
+    try:
+        result = await client(GetForumTopicsRequest(
+            peer=state.source,
+            offset_date=None,
+            offset_id=0,
+            offset_topic=0,
+            limit=50
+        ))
+        
+        if not result.topics:
+            await status.edit("⚠️ No topics found. Proceeding with Whole Group.")
+            state.source_type = 'group'
+            await asyncio.sleep(2)
+            await show_media_menu(event, state)
+            return
+
+        state.available_topics = {}
+        lines = ["**📁 Select a Topic:**\n"]
+        
+        for idx, topic in enumerate(result.topics, 1):
+            state.available_topics[str(idx)] = topic.id
+            lines.append(f"{idx}️⃣ {topic.title}")
+        
+        lines.append("\n0️⃣ Back")
+        await status.edit("\n".join(lines))
+    except Exception as e:
+        await status.edit(f"❌ Error fetching topics: {e}")
+        state.source_type = 'group'
+        await asyncio.sleep(2)
+        await show_media_menu(event, state)
 
 async def show_source_setup(event, state):
     state.waiting_for = 'setup_source'
@@ -279,15 +376,42 @@ async def start_siphon_process(event, state):
         "Photos": InputMessagesFilterPhotos()
     }
 
-    selected_filters = {state.media_type: all_filters[state.media_type]} if state.media_type != "All" else all_filters
     total_processed = 0
-    
-    for category, msg_filter in selected_filters.items():
-        current_header = f"🔄 **Siphoning {category}...** (Limit: {state.limit})"
-        await status_msg.edit(current_header)
 
-        async for message in client.iter_messages(source_entity, filter=msg_filter, limit=state.limit):
-            if message.media:
+    if state.source_type == 'topic':
+        # 🟢 Topic-Specific Flow (Multi-Category Buffer for Parity)
+        current_header = f"🔄 **Scanning Topic...** (Limit: {state.limit} per type)"
+        await status_msg.edit(current_header)
+        
+        categories_to_fetch = ["Voices", "Audios", "Videos", "Photos"] if state.media_type == "All" else [state.media_type]
+        media_buffer = {cat: [] for cat in categories_to_fetch}
+
+        # Step 1: Scan and Collect
+        async for message in client.iter_messages(source_entity, reply_to=state.topic_id):
+            # Stop if we hit the total limit for ALL requested categories
+            if all(len(msgs) >= state.limit for msgs in media_buffer.values()):
+                break
+
+            if not message.media:
+                continue
+
+            category = None
+            if message.voice: category = "Voices"
+            elif message.audio: category = "Audios"
+            elif message.video: category = "Videos"
+            elif message.photo: category = "Photos"
+
+            if category in media_buffer and len(media_buffer[category]) < state.limit:
+                media_buffer[category].append(message)
+
+        # Step 2: Process Buffered Messages
+        for category, messages in media_buffer.items():
+            if not messages: continue
+            
+            for index, message in enumerate(messages, 1):
+                current_status = f"🔄 **Mirroring {category}...** ({index}/{len(messages)})"
+                await status_msg.edit(current_status)
+
                 last_update = 0
                 async def progress(current, total):
                     nonlocal last_update
@@ -296,37 +420,19 @@ async def start_siphon_process(event, state):
                     if now - last_update < 1.0 and current < total:
                         return
                     last_update = now
-                    
                     bar = get_progress_bar(current, total)
-                    try: await status_msg.edit(f"{current_header}\n`{bar}`")
+                    try: await status_msg.edit(f"{current_status}\n`{bar}`")
                     except: pass
 
                 local_path = await downloader.download_media_with_progress(message, progress_callback=progress)
-                
                 if local_path:
                     try:
                         from telethon_utils import fast_upload
-                        
-                        # 2. Parallel Upload (Pre-stage in cloud)
-                        current_header = f"📤 **Uploading {category}...**"
-                        await status_msg.edit(current_header)
-                        
-                        uploaded_file = await fast_upload(
-                            client, 
-                            local_path, 
-                            workers=4, # Safe for 0.1 CPU
-                            progress_callback=progress
-                        )
-                        
-                        # 3. Mirroring to Target
+                        await status_msg.edit(f"📤 **Uploading {category}...**")
+                        uploaded_file = await fast_upload(client, local_path, workers=4, progress_callback=progress)
                         await status_msg.edit(f"🛰 **Finalizing Mirror...**\n`{os.path.basename(local_path)}`")
                         
-                        is_voice = message.audio and any(
-                            getattr(a, 'voice', False) 
-                            for a in message.media.document.attributes 
-                            if isinstance(a, DocumentAttributeAudio)
-                        )
-
+                        is_voice = category == "Voices"
                         await client.send_file(
                             dest_entity,
                             uploaded_file,
@@ -336,15 +442,51 @@ async def start_siphon_process(event, state):
                             attributes=message.media.document.attributes if hasattr(message.media, 'document') else None,
                             supports_streaming=True if category == "Videos" else False
                         )
-                    except Exception as upload_err:
-                        print(f"Upload error: {upload_err}")
+                        total_processed += 1
+                    except Exception as e: print(f"Upload error: {e}")
                     finally:
-                        # 4. Cleanup
-                        if os.path.exists(local_path):
-                            os.remove(local_path)
+                        if os.path.exists(local_path): os.remove(local_path)
                 
-                total_processed += 1
                 await asyncio.sleep(1.5)
+
+    else:
+        # 🔵 Whole Group Flow (Efficient Server-Side Filtering)
+        selected_filters = {state.media_type: all_filters[state.media_type]} if state.media_type != "All" else all_filters
+        
+        for category, msg_filter in selected_filters.items():
+            current_header = f"🔄 **Siphoning {category}...** (Limit: {state.limit})"
+            await status_msg.edit(current_header)
+
+            async for message in client.iter_messages(source_entity, filter=msg_filter, limit=state.limit):
+                if message.media:
+                    last_update = 0
+                    async def progress(current, total):
+                        nonlocal last_update
+                        import time
+                        now = time.time()
+                        if now - last_update < 1.0 and current < total:
+                            return
+                        last_update = now
+                        bar = get_progress_bar(current, total)
+                        try: await status_msg.edit(f"{current_header}\n`{bar}`")
+                        except: pass
+
+                    local_path = await downloader.download_media_with_progress(message, progress_callback=progress)
+                    if local_path:
+                        try:
+                            from telethon_utils import fast_upload
+                            await status_msg.edit(f"📤 **Uploading {category}...**")
+                            uploaded_file = await fast_upload(client, local_path, workers=4, progress_callback=progress)
+                            await status_msg.edit(f"🛰 **Finalizing Mirror...**\n`{os.path.basename(local_path)}`")
+                            
+                            is_voice = message.audio and any(getattr(a, 'voice', False) for a in message.media.document.attributes if isinstance(a, DocumentAttributeAudio))
+                            await client.send_file(dest_entity, uploaded_file, caption=message.message, formatting_entities=message.entities, voice_note=is_voice, attributes=message.media.document.attributes if hasattr(message.media, 'document') else None, supports_streaming=True if category == "Videos" else False)
+                        except Exception as e: print(f"Upload error: {e}")
+                        finally:
+                            if os.path.exists(local_path): os.remove(local_path)
+                    
+                    total_processed += 1
+                    await asyncio.sleep(1.5)
 
     # Final Summary - Register it specially
     done_msg = await event.respond(f"🏁 **Siphon Complete!**\nTotal: `{total_processed}` mirrored to `{getattr(dest_entity, 'title', state.destination)}`.")
