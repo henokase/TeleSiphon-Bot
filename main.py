@@ -119,6 +119,14 @@ async def get_owner_id():
     me = await client.get_me()
     return me.id
 
+async def exit_session(event, state):
+    """Exits the session and cleans up traces."""
+    m = await event.respond("👋 Exiting TeleSiphon...")
+    await register_msg(state, m)
+    await asyncio.sleep(1)
+    await clear_traces(state, is_exit=True)
+    user_states.pop(event.sender_id, None)
+
 # --- Command & Interaction Handlers ---
 
 @client.on(events.NewMessage(pattern=r'\.siphon'))
@@ -166,12 +174,13 @@ async def unified_input_handler(event):
             await proceed_to_media_or_topic(event, state)
         elif input_text == "2":
             await show_source_setup(event, state)
-        elif input_text == "3":
-            m = await event.respond("👋 Exiting TeleSiphon...")
-            await register_msg(state, m)
-            await asyncio.sleep(1)
-            await clear_traces(state, is_exit=True)
-            user_states.pop(event.sender_id, None)
+        elif input_text == "3" or input_upper == "X":
+            await exit_session(event, state)
+        return
+
+    # Global Exit check for all other menus
+    if input_upper == "X":
+        await exit_session(event, state)
         return
 
     # --- Routing: Configuration Sub-flows ---
@@ -180,11 +189,16 @@ async def unified_input_handler(event):
             await show_dest_setup(event, state)
         elif input_text == "2":
             state.waiting_for = 'source_input'
-            m = await event.respond("👉 **Forward a message** from source, or paste ID/Username.")
+            m = await event.respond("👉 **Forward a message** from source, or paste ID/Username.\n(Type `0` to cancel)")
             await register_msg(state, m)
+        elif input_text == "0":
+            await show_initial_menu(event, state)
         return
 
     if state.waiting_for == 'source_input':
+        if input_text == "0":
+            await show_source_setup(event, state)
+            return
         target = None
         if event.fwd_from:
             target = event.fwd_from.from_id or event.fwd_from.channel_id
@@ -205,6 +219,8 @@ async def unified_input_handler(event):
             await show_media_menu(event, state)
         elif input_text == "2":
             await show_topic_selection(event, state)
+        elif input_text == "0":
+            await show_dest_setup(event, state)
         return
 
     if state.waiting_for == 'topic_selection':
@@ -224,11 +240,16 @@ async def unified_input_handler(event):
             await proceed_to_media_or_topic(event, state)
         elif input_text == "3":
             state.waiting_for = 'dest_input'
-            m = await event.respond("👉 **Forward a message** from destination, or paste ID/Username.")
+            m = await event.respond("👉 **Forward a message** from destination, or paste ID/Username.\n(Type `0` to cancel)")
             await register_msg(state, m)
+        elif input_text == "0":
+            await show_source_setup(event, state)
         return
 
     if state.waiting_for == 'dest_input':
+        if input_text == "0":
+            await show_dest_setup(event, state)
+            return
         target = None
         if event.fwd_from:
             target = event.fwd_from.from_id or event.fwd_from.channel_id
@@ -248,6 +269,8 @@ async def unified_input_handler(event):
         if input_text in media_map:
             state.media_type = media_map[input_text]
             await show_limit_menu(event, state)
+        elif input_text == "0":
+            await proceed_to_media_or_topic(event, state)
         return
 
     if state.waiting_for == 'limit':
@@ -258,6 +281,8 @@ async def unified_input_handler(event):
         elif input_text.isdigit():
             state.limit = int(input_text)
             await start_siphon_process(event, state)
+        elif input_text == "0":
+            await show_media_menu(event, state)
         return
 
 # --- UI Generation Helpers ---
@@ -305,7 +330,9 @@ async def show_source_type_menu(event, state):
         "**📚 Forum Detected!**\n\n"
         "How would you like to siphon?\n"
         "1️⃣ Whole Group (Everything)\n"
-        "2️⃣ Specific Topic"
+        "2️⃣ Specific Topic\n\n"
+        "0️⃣ Back\n"
+        "✖️ Exit (type `X`)"
     )
     msg = await event.respond(text)
     await register_msg(state, msg)
@@ -339,6 +366,7 @@ async def show_topic_selection(event, state):
             lines.append(f"{idx}️⃣ {topic.title}")
         
         lines.append("\n0️⃣ Back")
+        lines.append("✖️ Exit (type `X`)")
         await status.edit("\n".join(lines))
     except Exception as e:
         await status.edit(f"❌ Error fetching topics: {e}")
@@ -351,7 +379,9 @@ async def show_source_setup(event, state):
     text = (
         f"**🔄 Source Setup** (Current: `{state.source}`)\n\n"
         "1️⃣ Keep Current\n"
-        "2️⃣ Enter New ID / Forward Message"
+        "2️⃣ Enter New ID / Forward Message\n\n"
+        "0️⃣ Back\n"
+        "✖️ Exit (type `X`)"
     )
     msg = await event.respond(text)
     await register_msg(state, msg)
@@ -362,7 +392,9 @@ async def show_dest_setup(event, state):
         f"**🎯 Destination Setup** (Current: `{state.destination}`)\n\n"
         "1️⃣ Keep Current\n"
         "2️⃣ Use Current Chat (where we are now)\n"
-        "3️⃣ Enter New ID / Forward Message"
+        "3️⃣ Enter New ID / Forward Message\n\n"
+        "0️⃣ Back\n"
+        "✖️ Exit (type `X`)"
     )
     msg = await event.respond(text)
     await register_msg(state, msg)
@@ -376,7 +408,9 @@ async def show_media_menu(event, state):
         "3️⃣ Videos\n"
         "4️⃣ Images\n"
         "5️⃣ Documents (PDF, Zip, etc.)\n"
-        "6️⃣ All"
+        "6️⃣ All\n\n"
+        "0️⃣ Back\n"
+        "✖️ Exit (type `X`)"
     )
     msg = await event.respond(text)
     await register_msg(state, msg)
@@ -389,7 +423,9 @@ async def show_limit_menu(event, state):
         "🇧 10 latest\n"
         "🇨 50 latest\n"
         "🇩 100 latest\n"
-        "💬 Or just type a **Custom Number** (e.g. `1` or `200`)."
+        "💬 Or just type a **Custom Number** (e.g. `1` or `200`).\n\n"
+        "0️⃣ Back\n"
+        "✖️ Exit (type `X`)"
     )
     msg = await event.respond(text)
     await register_msg(state, msg)
