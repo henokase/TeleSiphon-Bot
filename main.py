@@ -7,6 +7,7 @@ from telethon.tl.types import (
     InputMessagesFilterVideo,
     InputMessagesFilterVoice,
     InputMessagesFilterPhotos,
+    InputMessagesFilterDocument,
     DocumentAttributeAudio
 )
 from telethon.tl.functions.messages import GetForumTopicsRequest
@@ -222,7 +223,7 @@ async def unified_input_handler(event):
 
     # 8. Media Selection
     if state.waiting_for == 'media':
-        media_map = {"1": "Voices", "2": "Audios", "3": "Videos", "4": "Photos", "5": "All"}
+        media_map = {"1": "Voices", "2": "Audios", "3": "Videos", "4": "Photos", "5": "Documents", "6": "All"}
         if inp in media_map:
             state.media_type = media_map[inp]
             await show_limit_menu(event, state)
@@ -339,7 +340,8 @@ async def show_media_menu(event, state):
         "2️⃣ Audios\n"
         "3️⃣ Videos\n"
         "4️⃣ Images\n"
-        "5️⃣ All"
+        "5️⃣ Documents (PDF, Zip, etc.)\n"
+        "6️⃣ All"
     )
     msg = await event.respond(text)
     await register_msg(state, msg)
@@ -373,7 +375,8 @@ async def start_siphon_process(event, state):
         "Voices": InputMessagesFilterVoice(),
         "Audios": InputMessagesFilterMusic(),
         "Videos": InputMessagesFilterVideo(),
-        "Photos": InputMessagesFilterPhotos()
+        "Photos": InputMessagesFilterPhotos(),
+        "Documents": InputMessagesFilterDocument()
     }
 
     total_processed = 0
@@ -383,7 +386,7 @@ async def start_siphon_process(event, state):
         current_header = f"🔄 **Scanning Topic...** (Limit: {state.limit} per type)"
         await status_msg.edit(current_header)
         
-        categories_to_fetch = ["Voices", "Audios", "Videos", "Photos"] if state.media_type == "All" else [state.media_type]
+        categories_to_fetch = ["Voices", "Audios", "Videos", "Photos", "Documents"] if state.media_type == "All" else [state.media_type]
         media_buffer = {cat: [] for cat in categories_to_fetch}
 
         # Step 1: Scan and Collect
@@ -395,11 +398,12 @@ async def start_siphon_process(event, state):
             if not message.media:
                 continue
 
-            category = None
+            category = "Documents" # Default to documents
             if message.voice: category = "Voices"
             elif message.audio: category = "Audios"
             elif message.video: category = "Videos"
             elif message.photo: category = "Photos"
+            # If it's none of the above but has media, it stays "Documents"
 
             if category in media_buffer and len(media_buffer[category]) < state.limit:
                 media_buffer[category].append(message)
@@ -479,8 +483,10 @@ async def start_siphon_process(event, state):
                             uploaded_file = await fast_upload(client, local_path, workers=4, progress_callback=progress)
                             await status_msg.edit(f"🛰 **Finalizing Mirror...**\n`{os.path.basename(local_path)}`")
                             
-                            is_voice = message.audio and any(getattr(a, 'voice', False) for a in message.media.document.attributes if isinstance(a, DocumentAttributeAudio))
-                            await client.send_file(dest_entity, uploaded_file, caption=message.message, formatting_entities=message.entities, voice_note=is_voice, attributes=message.media.document.attributes if hasattr(message.media, 'document') else None, supports_streaming=True if category == "Videos" else False)
+                            media_attrs = message.media.document.attributes if hasattr(message.media, 'document') else None
+                            is_voice = category == "Voices"
+                            
+                            await client.send_file(dest_entity, uploaded_file, caption=message.message, formatting_entities=message.entities, voice_note=is_voice, attributes=media_attrs, supports_streaming=True if category == "Videos" else False)
                         except Exception as e: print(f"Upload error: {e}")
                         finally:
                             if os.path.exists(local_path): os.remove(local_path)
@@ -495,5 +501,5 @@ async def start_siphon_process(event, state):
 
     # Reset for another round
     await asyncio.sleep(3)
-    await clear_traces(state) # No keep_summary needed, default behavior is to keep summary
+    await clear_traces(state)
     await show_initial_menu(event, state)
