@@ -14,6 +14,7 @@ Dependencies:
 import os
 import asyncio
 import re
+from urllib.parse import urlparse, parse_qs
 from telethon import events
 from telethon.tl.types import (
     InputMessagesFilterMusic,
@@ -70,6 +71,118 @@ class SiphonState:
 downloader = DownloadManager(client)
 
 # --- Helper Functions ---
+
+async def get_chat_name(chat_id) -> str:
+    """Resolves a chat ID to its display name (title or username)."""
+    if not chat_id:
+        return "Not Set"
+    try:
+        entity = await client.get_entity(chat_id)
+        return getattr(entity, 'title', None) or getattr(entity, 'username', None) or str(chat_id)
+    except Exception:
+        return str(chat_id)
+
+def parse_message_link(link: str) -> dict:
+    """
+    Parses a Telegram message link and extracts chat_id, message_id, and optionally topic_id.
+    
+    Supported formats:
+    - https://t.me/c/chat_id/message_id
+    - https://t.me/c/chat_id/topic_id/message_id
+    - https://t.me/username/message_id
+    
+    Returns:
+        dict with 'chat_id', 'message_id', 'topic_id' (optional), or None if invalid.
+    """
+    result = {'chat_id': None, 'message_id': None, 'topic_id': None}
+    
+    link = link.strip()
+    if not link:
+        return None
+    
+    parsed = urlparse(link)
+    if parsed.netloc not in ('t.me', 'telegram.me', ''):
+        return None
+    
+    path_parts = parsed.path.strip('/').split('/')
+    
+    if path_parts[0] == 'c' and len(path_parts) >= 3:
+        try:
+            result['chat_id'] = int(path_parts[1])
+            if len(path_parts) >= 4:
+                result['topic_id'] = int(path_parts[2])
+                result['message_id'] = int(path_parts[3])
+            else:
+                result['message_id'] = int(path_parts[2])
+        except (ValueError, IndexError):
+            return None
+    elif len(path_parts) >= 2:
+        result['username'] = path_parts[0]
+        try:
+            result['message_id'] = int(path_parts[1])
+        except (ValueError, IndexError):
+            return None
+    else:
+        return None
+    
+    return result if result['message_id'] else None
+
+async def get_message_by_link(link: str):
+    """
+    Fetches a message by its Telegram link.
+    
+    Args:
+        link: Telegram message link (e.g., https://t.me/c/123456/1 or https://t.me/username/1)
+    
+    Returns:
+        Telethon Message object, or None if not found/invalid.
+    """
+    parsed = parse_message_link(link)
+    if not parsed:
+        return None
+    
+    try:
+        if 'username' in parsed:
+            entity = await client.get_entity(parsed['username'])
+        else:
+            chat_id = parsed['chat_id']
+            if chat_id > 0:
+                entity = await client.get_entity(-1000000000000 - chat_id)
+            else:
+                entity = await client.get_entity(chat_id)
+        
+        msg = await client.get_messages(entity, ids=parsed['message_id'])
+        
+        if parsed.get('topic_id') and hasattr(entity, 'forum') and entity.forum:
+            for reply in await client.iter_messages(entity, limit=50, reverse=False):
+                if reply.reply_to and reply.reply_to.reply_to_msg_id == parsed['topic_id'] and reply.id == parsed['message_id']:
+                    return reply
+            return None
+        
+        return msg
+    except Exception as e:
+        print(f"[ERROR] Failed to get message by link {link}: {e}")
+        return None
+
+async def parse_and_fetch_messages(links_text: str) -> list:
+    """
+    Parses multiple message links (comma-separated) and fetches associated messages.
+    
+    Args:
+        links_text: Comma-separated message links
+        
+    Returns:
+        List of (Message, parsed_info) tuples.
+    """
+    messages = []
+    links = [l.strip() for l in links_text.split(',') if l.strip()]
+    
+    for link in links:
+        msg = await get_message_by_link(link)
+        if msg:
+            messages.append(msg)
+    
+    return messages
 
 async def register_msg(state: SiphonState, msg):
     """
@@ -173,8 +286,24 @@ async def unified_input_handler(event):
                 return
             await proceed_to_media_or_topic(event, state)
         elif input_text == "2":
+            state.waiting_for = 'msg_link_input'
+            m = await event.respond(
+                "📎 **Siphon by Message Link**\n\n"
+                "Send the message link(s). Separate multiple links with commas.\n\n"
+                "Example:\n"
+                "```https://t.me/c/123456/1, https://t.me/c/123456/2```\n\n"
+                "0️⃣ Back\n"
+                "✖️ Exit (type `X`)"
+            )
+            await register_msg(state, m)
+            return
+        elif input_text == "3":
+            m = await event.respond("⚠️ **Coming Soon**: Siphon by Date Range\n\nThis feature is not yet implemented.")
+            await register_msg(state, m)
+            return
+        elif input_text == "4":
             await show_source_setup(event, state)
-        elif input_text == "3" or input_upper == "X":
+        elif input_upper == "X":
             await exit_session(event, state)
         return
 
@@ -220,7 +349,7 @@ async def unified_input_handler(event):
         elif input_text == "2":
             await show_topic_selection(event, state)
         elif input_text == "0":
-            await show_dest_setup(event, state)
+            await show_initial_menu(event, state)
         return
 
     if state.waiting_for == 'topic_selection':
@@ -234,10 +363,10 @@ async def unified_input_handler(event):
 
     if state.waiting_for == 'setup_dest':
         if input_text == "1":
-            await proceed_to_media_or_topic(event, state)
+            await show_initial_menu(event, state)
         elif input_text == "2":
             state.destination = state.interaction_chat_id
-            await proceed_to_media_or_topic(event, state)
+            await show_initial_menu(event, state)
         elif input_text == "3":
             state.waiting_for = 'dest_input'
             m = await event.respond("👉 **Forward a message** from destination, or paste ID/Username.\n(Type `0` to cancel)")
@@ -260,7 +389,7 @@ async def unified_input_handler(event):
         
         if target:
             state.destination = target
-            await proceed_to_media_or_topic(event, state)
+            await show_initial_menu(event, state)
         return
 
     # --- Routing: Filtering & Limit Selection ---
@@ -285,18 +414,30 @@ async def unified_input_handler(event):
             await show_media_menu(event, state)
         return
 
+    if state.waiting_for == 'msg_link_input':
+        if input_text == "0":
+            await show_initial_menu(event, state)
+            return
+        
+        await process_message_links(event, state, input_text)
+        return
+
 # --- UI Generation Helpers ---
 
 async def show_initial_menu(event, state):
     state.waiting_for = 'init'
+    source_name = await get_chat_name(state.source) if state.source else "Not Set"
+    dest_name = await get_chat_name(state.destination) if state.destination else "Not Set"
     text = (
-        "**🚀 TeleSiphon - Initial Setup**\n\n"
-        f"**Source:** `{state.source or 'Not Set'}`\n"
-        f"**Destination:** `{state.destination or 'Not Set'}`\n\n"
-        "**How would you like to proceed?**\n"
-        "1️⃣ Continue with Defaults\n"
-        "2️⃣ Change Settings\n"
-        "3️⃣ Exit"
+        "**🚀 TeleSiphon - Control Panel**\n\n"
+        f"**Source:** `{source_name}`\n"
+        f"**Destination:** `{dest_name}`\n\n"
+        "**Select Action:**\n"
+        "1️⃣ Siphon Media\n"
+        "2️⃣ Siphon by Message Link\n"
+        "3️⃣ Siphon by Date Range\n"
+        "4️⃣ Change Source & Destination\n\n"
+        "✖️ Exit (type `X`)"
     )
     msg = await event.respond(text)
     await register_msg(state, msg)
@@ -429,6 +570,103 @@ async def show_limit_menu(event, state):
     )
     msg = await event.respond(text)
     await register_msg(state, msg)
+
+# --- Message Link Processing ---
+
+async def process_message_links(event, state, links_text: str):
+    """
+    Processes message links and downloads media to destination.
+    """
+    state.waiting_for = None
+    status_msg = await event.respond("🔗 **Parsing message links...**")
+    await register_msg(state, status_msg)
+    
+    links = [l.strip() for l in links_text.split(',') if l.strip()]
+    
+    if not links:
+        await status_msg.edit("❌ No valid links provided.")
+        await asyncio.sleep(2)
+        await show_initial_menu(event, state)
+        return
+    
+    messages = []
+    failed_links = []
+    
+    for link in links:
+        msg = await get_message_by_link(link)
+        if msg and msg.media:
+            messages.append(msg)
+        else:
+            failed_links.append(link)
+    
+    if not messages:
+        await status_msg.edit(f"❌ No media found in provided links.")
+        if failed_links:
+            print(f"[WARN] Failed links: {failed_links}")
+        await asyncio.sleep(2)
+        await show_initial_menu(event, state)
+        return
+    
+    dest_entity = None
+    try:
+        dest_entity = await client.get_entity(state.destination)
+    except Exception as e:
+        await status_msg.edit(f"❌ **Error resolving destination:** {e}")
+        return
+    
+    total_processed = 0
+    
+    await status_msg.edit(f"📥 **Found {len(messages)} media file(s). Starting download...**")
+    
+    for index, message in enumerate(messages, 1):
+        current_status = f"📥 **Downloading...** ({index}/{len(messages)})"
+        await status_msg.edit(current_status)
+        
+        async def progress(current, total):
+            bar = get_progress_bar(current, total)
+            try:
+                await status_msg.edit(f"{current_status}\n`{bar}`")
+            except Exception:
+                pass
+        
+        local_path = await downloader.download_media_with_progress(message, progress_callback=progress)
+        
+        if local_path:
+            try:
+                from telethon_utils import fast_upload
+                await status_msg.edit(f"📤 **Uploading...** ({index}/{len(messages)})")
+                uploaded_file = await fast_upload(client, local_path, workers=4, progress_callback=progress)
+                await status_msg.edit(f"🛰 **Finalizing...**\n`{os.path.basename(local_path)}`")
+                
+                is_voice = bool(message.voice)
+                doc_attrs = message.media.document.attributes if hasattr(message.media, 'document') else None
+                
+                await client.send_file(
+                    dest_entity,
+                    uploaded_file,
+                    caption=message.message,
+                    formatting_entities=message.entities,
+                    voice_note=is_voice,
+                    attributes=doc_attrs,
+                    supports_streaming=True if message.video else False
+                )
+                total_processed += 1
+            except Exception as e:
+                print(f"[ERROR] Mirroring failed: {e}")
+            finally:
+                if os.path.exists(local_path):
+                    os.remove(local_path)
+        
+        await asyncio.sleep(1)
+    
+    final_summary = f"🏁 **Siphon Complete!**\nTotal: `{total_processed}` file(s) mirrored."
+    done_msg = await event.respond(final_summary)
+    state.summary_msg_id = done_msg.id
+    await register_msg(state, done_msg)
+    
+    await asyncio.sleep(3)
+    await clear_traces(state)
+    await show_initial_menu(event, state)
 
 # --- Primary Mirroring Pipeline Engine ---
 
