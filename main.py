@@ -14,6 +14,7 @@ Dependencies:
 import os
 import asyncio
 import re
+from datetime import datetime, timedelta
 from urllib.parse import urlparse, parse_qs
 from telethon import events
 from telethon.tl.types import (
@@ -62,6 +63,10 @@ class SiphonState:
         self.source_type = 'group' # 'group' or 'topic'
         self.topic_id = None
         self.available_topics = {} 
+        
+        self.date_mode = False
+        self.start_date = None
+        self.end_date = None
         
         self.interaction_chat_id = chat_id
         self.interaction_msg_ids = []  # IDs for session cleanup
@@ -184,6 +189,98 @@ async def parse_and_fetch_messages(links_text: str) -> list:
     
     return messages
 
+def parse_date_input(date_str: str, end_of_day: bool = False) -> datetime:
+    """
+    Parses various date input formats and returns a datetime object.
+    
+    Args:
+        date_str: The date string to parse.
+        end_of_day: If True, returns datetime at 23:59:59 (for end date).
+    
+    Supported formats:
+    - YYYY-MM-DD, YYYY-M-DD, YYYY-MM-D
+    - YY-MM-DD (year as 2000 + YY, e.g., 26 -> 2026)
+    - MM-DD (use current year)
+    - DD (use current year and month)
+    
+    Single digit months/days without leading zero are supported.
+    """
+    date_str = date_str.strip().replace('/', '-').replace('.', '-')
+    
+    parts = date_str.split('-')
+    if not parts or not parts[0]:
+        return None
+    
+    now = datetime.now()
+    year = now.year
+    month = now.month
+    day = 1
+    
+    def parse_2digit(s: str) -> int:
+        """Parses a string as 1-2 digit number."""
+        if not s:
+            return 1
+        return int(s)
+    
+    if len(parts) == 1:
+        day = parse_2digit(parts[0])
+    elif len(parts) == 2:
+        month = parse_2digit(parts[0])
+        day = parse_2digit(parts[1])
+    elif len(parts) >= 3:
+        year_val = parse_2digit(parts[0])
+        if year_val < 100:
+            year = 2000 + year_val
+        else:
+            year = year_val
+        month = parse_2digit(parts[1])
+        day = parse_2digit(parts[2])
+    
+    try:
+        if end_of_day:
+            return datetime(year, month, day, 23, 59, 59)
+        return datetime(year, month, day)
+    except ValueError:
+        day = min(day, 28)
+        if end_of_day:
+            return datetime(year, month, day, 23, 59, 59)
+        return datetime(year, month, day)
+
+def parse_date_range(date_text: str) -> tuple:
+    """
+    Parses date text that can be a single date or two dates separated by comma.
+    
+    Returns:
+        (start_date, end_date) tuple of datetime objects.
+        
+    Logic:
+        - Single date: start_date = end_date = that date (only that day)
+        - "date1,date2": range from date1 to date2
+        - "date1," (trailing comma): start_date to now
+    """
+    date_text = date_text.strip()
+    
+    has_trailing_comma = date_text.endswith(',')
+    dates = [d.strip() for d in date_text.split(',') if d.strip()]
+    
+    if not dates:
+        return None, None
+    
+    start_date = parse_date_input(dates[0])
+    
+    if len(dates) > 1:
+        end_date = parse_date_input(dates[1], end_of_day=True)
+    elif has_trailing_comma:
+        end_date = datetime.now()
+    else:
+        end_date = parse_date_input(dates[0], end_of_day=True)
+    
+    return start_date, end_date
+
+def is_within_date_range(msg_date: datetime, start_date: datetime, end_date: datetime) -> bool:
+    """Checks if a message date is within the given range (inclusive)."""
+    return start_date <= msg_date.replace(tzinfo=None) <= end_date.replace(tzinfo=None)
+
 async def register_msg(state: SiphonState, msg):
     """
     Registers a message ID for subsequent session cleanup.
@@ -298,7 +395,20 @@ async def unified_input_handler(event):
             await register_msg(state, m)
             return
         elif input_text == "3":
-            m = await event.respond("⚠️ **Coming Soon**: Siphon by Date Range\n\nThis feature is not yet implemented.")
+            state.waiting_for = 'date_input'
+            m = await event.respond(
+                "📅 **Siphon by Date Range**\n\n"
+                "Enter the date range.\n\n"
+                "**Single date:** YYYY-MM-DD → only that day\n"
+                "**Date range:** YYYY-MM-DD, YYYY-MM-DD\n"
+                "**To now:** Add trailing comma `YYYY-MM-DD,`\n\n"
+                "Short formats:\n"
+                "- `MM-DD` (only that month-day)\n"
+                "- `DD` (only that day of current month)\n"
+                "- `26-11-21` → 2026-11-21\n\n"
+                "0️⃣ Back\n"
+                "✖️ Exit (type `X`)"
+            )
             await register_msg(state, m)
             return
         elif input_text == "4":
@@ -397,7 +507,11 @@ async def unified_input_handler(event):
         media_map = {"1": "Voices", "2": "Audios", "3": "Videos", "4": "Photos", "5": "Documents", "6": "All"}
         if input_text in media_map:
             state.media_type = media_map[input_text]
-            await show_limit_menu(event, state)
+            if state.date_mode:
+                state.limit = 999999
+                await start_siphon_process(event, state)
+            else:
+                await show_limit_menu(event, state)
         elif input_text == "0":
             await proceed_to_media_or_topic(event, state)
         return
@@ -420,6 +534,25 @@ async def unified_input_handler(event):
             return
         
         await process_message_links(event, state, input_text)
+        return
+
+    if state.waiting_for == 'date_input':
+        if input_text == "0":
+            await show_initial_menu(event, state)
+            return
+        
+        start_date, end_date = parse_date_range(input_text)
+        
+        if not start_date:
+            m = await event.respond("❌ Invalid date format. Try again.")
+            await register_msg(state, m)
+            return
+        
+        state.date_mode = True
+        state.start_date = start_date
+        state.end_date = end_date
+        
+        await proceed_to_media_or_topic(event, state)
         return
 
 # --- UI Generation Helpers ---
@@ -673,6 +806,7 @@ async def process_message_links(event, state, links_text: str):
 async def start_siphon_process(event, state):
     """
     Executes the mirroring process based on the confirmed session state.
+    Supports date range filtering when state.date_mode is True.
     """
     state.waiting_for = None
     status_msg = await event.respond("🔍 **Resolving targets...**")
@@ -685,7 +819,6 @@ async def start_siphon_process(event, state):
         await status_msg.edit(f"❌ **Error resolving entities:** {e}")
         return
 
-    # Configuration for server-side filtering
     all_filters = {
         "Voices": InputMessagesFilterVoice(),
         "Audios": InputMessagesFilterMusic(),
@@ -695,136 +828,171 @@ async def start_siphon_process(event, state):
     }
 
     total_processed = 0
+    is_date_mode = getattr(state, 'date_mode', False)
+    start_date = getattr(state, 'start_date', None)
+    end_date = getattr(state, 'end_date', datetime.now())
+    
+    if is_date_mode:
+        start_str = start_date.strftime("%Y-%m-%d") if start_date else "beginning"
+        end_str = end_date.strftime("%Y-%m-%d") if end_date else "now"
+        await status_msg.edit(f"📅 **Filtering by date:** {start_str} → {end_str}")
+
+    def filter_by_date(message) -> bool:
+        """Date filter for messages (inclusive of both start and end)."""
+        if not is_date_mode or not start_date or not end_date:
+            return True
+        msg_dt = message.date
+        if msg_dt is None:
+            return False
+        return start_date.replace(tzinfo=None) <= msg_dt.replace(tzinfo=None) <= end_date.replace(tzinfo=None)
 
     if state.source_type == 'topic':
-        # --- Logic: Topic-Specific Flow (Buffered Single Pass) ---
-        current_header = f"🔄 **Scanning Topic...** (Limit: {state.limit} per type)"
+        current_header = f"🔄 **Scanning Topic...**"
+        if is_date_mode:
+            current_header += f" ({start_date.strftime('%Y-%m-%d')} - {end_date.strftime('%Y-%m-%d')})"
         await status_msg.edit(current_header)
         
         categories_to_fetch = ["Voices", "Audios", "Videos", "Photos", "Documents"] if state.media_type == "All" else [state.media_type]
-        media_buffer = {cat: [] for cat in categories_to_fetch}
-
-        # Scan topic history and buffer requested media types
-        async for message in client.iter_messages(source_entity, reply_to=state.topic_id):
-            if all(len(msgs) >= state.limit for msgs in media_buffer.values()):
-                break
-
+        
+        messages_to_process = []
+        async for message in client.iter_messages(source_entity, reply_to=state.topic_id, reverse=is_date_mode):
             if not message.media:
                 continue
-
-            category = "Documents" # Fallback categorization
+            if not filter_by_date(message):
+                continue
+            
+            category = "Documents"
             if message.voice: category = "Voices"
             elif message.audio: category = "Audios"
             elif message.video: category = "Videos"
             elif message.photo: category = "Photos"
-
-            if category in media_buffer and len(media_buffer[category]) < state.limit:
-                media_buffer[category].append(message)
-
-        # Process the collected buffer
-        for category, messages in media_buffer.items():
-            if not messages: continue
             
-            for index, message in enumerate(messages, 1):
-                current_status = f"🔄 **Mirroring {category}...** ({index}/{len(messages)})"
-                await status_msg.edit(current_status)
-
-                async def progress(current, total):
-                    bar = get_progress_bar(current, total)
-                    try: 
-                        await status_msg.edit(f"{current_status}\n`{bar}`")
-                    except Exception: 
-                        pass
-
-                local_path = await downloader.download_media_with_progress(message, progress_callback=progress)
-                if local_path:
-                    try:
-                        from telethon_utils import fast_upload
-                        await status_msg.edit(f"📤 **Uploading {category}...**")
-                        uploaded_file = await fast_upload(client, local_path, workers=4, progress_callback=progress)
-                        await status_msg.edit(f"🛰 **Finalizing Mirror...**\n`{os.path.basename(local_path)}`")
-                        
-                        is_voice = category == "Voices"
-                        doc_attrs = message.media.document.attributes if hasattr(message.media, 'document') else None
-                        
-                        await client.send_file(
-                            dest_entity,
-                            uploaded_file,
-                            caption=message.message,
-                            formatting_entities=message.entities,
-                            voice_note=is_voice,
-                            attributes=doc_attrs,
-                            supports_streaming=True if category == "Videos" else False
-                        )
-                        total_processed += 1
-                    except Exception as e:
-                        # Log error internally and continue
-                        print(f"[ERROR] Mirroring failed: {e}")
-                    finally:
-                        if os.path.exists(local_path): os.remove(local_path)
-                
-                await asyncio.sleep(1.5)
-
-    else:
-        # --- Logic: Whole Group Flow (Efficient Server-Side Search) ---
-        target_categories = [state.media_type] if state.media_type != "All" else all_filters.keys()
+            if category in categories_to_fetch:
+                messages_to_process.append(message)
+            
+            if not is_date_mode and len(messages_to_process) >= state.limit:
+                break
         
+        messages_to_process.sort(key=lambda m: m.date, reverse=False)
+        
+        for index, message in enumerate(messages_to_process, 1):
+            category = "Documents"
+            if message.voice: category = "Voices"
+            elif message.audio: category = "Audios"
+            elif message.video: category = "Videos"
+            elif message.photo: category = "Photos"
+            
+            current_status = f"🔄 **Mirroring {category}...** ({index}/{len(messages_to_process)})"
+            await status_msg.edit(current_status)
+
+            async def progress(current, total):
+                bar = get_progress_bar(current, total)
+                try: 
+                    await status_msg.edit(f"{current_status}\n`{bar}`")
+                except Exception: 
+                    pass
+
+            local_path = await downloader.download_media_with_progress(message, progress_callback=progress)
+            if local_path:
+                try:
+                    from telethon_utils import fast_upload
+                    await status_msg.edit(f"📤 **Uploading {category}...**")
+                    uploaded_file = await fast_upload(client, local_path, workers=4, progress_callback=progress)
+                    await status_msg.edit(f"🛰 **Finalizing Mirror...**\n`{os.path.basename(local_path)}`")
+                    
+                    is_voice = category == "Voices"
+                    doc_attrs = message.media.document.attributes if hasattr(message.media, 'document') else None
+                    
+                    await client.send_file(
+                        dest_entity,
+                        uploaded_file,
+                        caption=message.message,
+                        formatting_entities=message.entities,
+                        voice_note=is_voice,
+                        attributes=doc_attrs,
+                        supports_streaming=True if category == "Videos" else False
+                    )
+                    total_processed += 1
+                except Exception as e:
+                    print(f"[ERROR] Mirroring failed: {e}")
+                finally:
+                    if os.path.exists(local_path): os.remove(local_path)
+            
+            await asyncio.sleep(1)
+    else:
+        target_categories = [state.media_type] if state.media_type != "All" else list(all_filters.keys())
+        
+        all_messages = []
         for category in target_categories:
             msg_filter = all_filters[category]
-            current_header = f"🔄 **Siphoning {category}...** (Limit: {state.limit})"
+            current_header = f"🔄 **Siphoning {category}...**"
+            if is_date_mode:
+                current_header += f" ({start_date.strftime('%Y-%m-%d')} - {end_date.strftime('%Y-%m-%d')})"
             await status_msg.edit(current_header)
 
-            async for message in client.iter_messages(source_entity, filter=msg_filter, limit=state.limit):
-                if not message.media: continue
-
-                async def progress(current, total):
-                    bar = get_progress_bar(current, total)
-                    try: 
-                        await status_msg.edit(f"{current_header}\n`{bar}`")
-                    except Exception: 
-                        pass
-
-                local_path = await downloader.download_media_with_progress(message, progress_callback=progress)
-                if local_path:
-                    try:
-                        from telethon_utils import fast_upload
-                        await status_msg.edit(f"📤 **Uploading {category}...**")
-                        uploaded_file = await fast_upload(client, local_path, workers=4, progress_callback=progress)
-                        await status_msg.edit(f"🛰 **Finalizing Mirror...**\n`{os.path.basename(local_path)}`")
-                        
-                        doc_attrs = message.media.document.attributes if hasattr(message.media, 'document') else None
-                        is_voice = category == "Voices"
-                        
-                        await client.send_file(
-                            dest_entity, 
-                            uploaded_file, 
-                            caption=message.message, 
-                            formatting_entities=message.entities, 
-                            voice_note=is_voice, 
-                            attributes=doc_attrs, 
-                            supports_streaming=True if category == "Videos" else False
-                        )
-                        total_processed += 1
-                    except Exception as e:
-                        print(f"[ERROR] Siphon failed: {e}")
-                    finally:
-                        if os.path.exists(local_path): os.remove(local_path)
+            async for message in client.iter_messages(source_entity, filter=msg_filter, reverse=is_date_mode):
+                if not message.media:
+                    continue
+                if not filter_by_date(message):
+                    continue
+                all_messages.append(message)
                 
-                await asyncio.sleep(1.5)
+                if not is_date_mode and len(all_messages) >= state.limit:
+                    break
+        
+        all_messages.sort(key=lambda m: m.date, reverse=False)
+        
+        for index, message in enumerate(all_messages, 1):
+            category = "Documents"
+            if message.voice: category = "Voices"
+            elif message.audio: category = "Audios"
+            elif message.video: category = "Videos"
+            elif message.photo: category = "Photos"
+            
+            current_status = f"🔄 **Mirroring...** ({index}/{len(all_messages)})"
+            await status_msg.edit(current_status)
 
-    # Completion handling
+            async def progress(current, total):
+                bar = get_progress_bar(current, total)
+                try: 
+                    await status_msg.edit(f"{current_status}\n`{bar}`")
+                except Exception: 
+                    pass
+
+            local_path = await downloader.download_media_with_progress(message, progress_callback=progress)
+            if local_path:
+                try:
+                    from telethon_utils import fast_upload
+                    await status_msg.edit(f"📤 **Uploading...** ({index}/{len(all_messages)})")
+                    uploaded_file = await fast_upload(client, local_path, workers=4, progress_callback=progress)
+                    await status_msg.edit(f"🛰 **Finalizing Mirror...**\n`{os.path.basename(local_path)}`")
+                    
+                    doc_attrs = message.media.document.attributes if hasattr(message.media, 'document') else None
+                    is_voice = category == "Voices"
+                    
+                    await client.send_file(
+                        dest_entity, 
+                        uploaded_file, 
+                        caption=message.message, 
+                        formatting_entities=message.entities, 
+                        voice_note=is_voice, 
+                        attributes=doc_attrs, 
+                        supports_streaming=True if category == "Videos" else False
+                    )
+                    total_processed += 1
+                except Exception as e:
+                    print(f"[ERROR] Siphon failed: {e}")
+                finally:
+                    if os.path.exists(local_path): os.remove(local_path)
+            
+            await asyncio.sleep(1)
+
     final_summary = f"🏁 **Siphon Complete!**\nTotal: `{total_processed}` mirrored to `{getattr(dest_entity, 'title', state.destination)}`."
     done_msg = await event.respond(final_summary)
     state.summary_msg_id = done_msg.id
     await register_msg(state, done_msg)
 
-    # Automatic cleanup and reset
     await asyncio.sleep(3)
     await clear_traces(state)
-    await show_initial_menu(event, state)
-    await register_msg(state, done_msg)
-
-    # Reset for another round
-    await asyncio.sleep(3)
-    await clear_traces(state)
+    state.interaction_msg_ids = [state.summary_msg_id]
     await show_initial_menu(event, state)
