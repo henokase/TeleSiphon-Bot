@@ -803,6 +803,118 @@ async def process_message_links(event, state, links_text: str):
 
 # --- Primary Mirroring Pipeline Engine ---
 
+async def process_photos_with_albums(event, status_msg, dest_entity, photo_messages):
+    """
+    Process photo messages, handling albums and individual photos separately.
+    Albums are sent as groups, individual photos as single files.
+    Order: albums first (chronological), then individual photos.
+    """
+    if not photo_messages:
+        return 0
+    
+    albums = {}
+    individuals = []
+    
+    for msg in photo_messages:
+        gid = msg.grouped_id
+        if gid:
+            if gid not in albums:
+                albums[gid] = []
+            albums[gid].append(msg)
+        else:
+            individuals.append(msg)
+    
+    total = 0
+    all_items = []
+    
+    for gid, msgs in albums.items():
+        all_items.append(('album', msgs))
+    
+    for msg in individuals:
+        all_items.append(('individual', [msg]))
+    
+    def get_item_date(item):
+        item_data = item[1]
+        if isinstance(item_data, list):
+            return item_data[0].date if item_data[0].date else datetime.min
+        return item_data.date if item_data.date else datetime.min
+    
+    all_items.sort(key=get_item_date)
+    
+    total_count = len(all_items)
+    
+    for idx, (item_type, msgs) in enumerate(all_items, 1):
+        if item_type == 'album':
+            caption = msgs[0].message
+            entities = msgs[0].entities
+            
+            current_status = f"🖼️ **Sending Album ({len(msgs)} photos)...** ({idx}/{total_count})"
+            await status_msg.edit(current_status)
+            
+            file_paths = []
+            for m in msgs:
+                path = await downloader.download_media_with_progress(m)
+                if path:
+                    file_paths.append(path)
+            
+            if file_paths:
+                try:
+                    uploaded = []
+                    for fp in file_paths:
+                        from telethon_utils import fast_upload
+                        upl = await fast_upload(client, fp, workers=4)
+                        uploaded.append(upl)
+                        os.remove(fp)
+                    
+                    await client.send_file(
+                        dest_entity,
+                        uploaded,
+                        caption=caption,
+                        formatting_entities=entities
+                    )
+                    total += len(uploaded)
+                except Exception as e:
+                    print(f"[ERROR] Album send failed: {e}")
+                finally:
+                    for fp in file_paths:
+                        if os.path.exists(fp):
+                            os.remove(fp)
+        else:
+            msg = msgs[0]
+            current_status = f"🖼️ **Sending Photo...** ({idx}/{total_count})"
+            await status_msg.edit(current_status)
+            
+            async def progress(current, total):
+                bar = get_progress_bar(current, total)
+                try:
+                    await status_msg.edit(f"{current_status}\n`{bar}`")
+                except Exception:
+                    pass
+            
+            local_path = await downloader.download_media_with_progress(msg, progress_callback=progress)
+            if local_path:
+                try:
+                    from telethon_utils import fast_upload
+                    await status_msg.edit(f"📤 **Uploading Photo...**")
+                    uploaded = await fast_upload(client, local_path, workers=4, progress_callback=progress)
+                    
+                    await client.send_file(
+                        dest_entity,
+                        uploaded,
+                        caption=msg.message,
+                        formatting_entities=msg.entities
+                    )
+                    total += 1
+                except Exception as e:
+                    print(f"[ERROR] Photo send failed: {e}")
+                finally:
+                    if os.path.exists(local_path):
+                        os.remove(local_path)
+        
+        await asyncio.sleep(1)
+    
+    return total
+
 async def start_siphon_process(event, state):
     """
     Executes the mirroring process based on the confirmed session state.
@@ -854,7 +966,8 @@ async def start_siphon_process(event, state):
         
         categories_to_fetch = ["Voices", "Audios", "Videos", "Photos", "Documents"] if state.media_type == "All" else [state.media_type]
         
-        messages_to_process = []
+        category_messages = {cat: [] for cat in categories_to_fetch}
+        
         async for message in client.iter_messages(source_entity, reply_to=state.topic_id, reverse=is_date_mode):
             if not message.media:
                 continue
@@ -867,125 +980,139 @@ async def start_siphon_process(event, state):
             elif message.video: category = "Videos"
             elif message.photo: category = "Photos"
             
-            if category in categories_to_fetch:
-                messages_to_process.append(message)
+            if category not in categories_to_fetch:
+                continue
             
-            if not is_date_mode and len(messages_to_process) >= state.limit:
-                break
+            category_messages[category].append(message)
+            
+            if not is_date_mode:
+                total_count = sum(len(v) for v in category_messages.values())
+                if total_count >= state.limit * len(categories_to_fetch):
+                    break
         
-        messages_to_process.sort(key=lambda m: m.date, reverse=False)
-        
-        for index, message in enumerate(messages_to_process, 1):
-            category = "Documents"
-            if message.voice: category = "Voices"
-            elif message.audio: category = "Audios"
-            elif message.video: category = "Videos"
-            elif message.photo: category = "Photos"
-            
-            current_status = f"🔄 **Mirroring {category}...** ({index}/{len(messages_to_process)})"
-            await status_msg.edit(current_status)
+        for category in categories_to_fetch:
+            if category == "Photos":
+                photo_msgs = category_messages["Photos"]
+                if photo_msgs:
+                    photo_msgs.sort(key=lambda m: m.date, reverse=False)
+                    photo_count = await process_photos_with_albums(event, status_msg, dest_entity, photo_msgs)
+                    total_processed += photo_count
+            else:
+                msgs = category_messages[category]
+                msgs.sort(key=lambda m: m.date, reverse=False)
+                
+                for index, message in enumerate(msgs, 1):
+                    current_status = f"🔄 **Mirroring {category}...** ({index}/{len(msgs)})"
+                    await status_msg.edit(current_status)
 
-            async def progress(current, total):
-                bar = get_progress_bar(current, total)
-                try: 
-                    await status_msg.edit(f"{current_status}\n`{bar}`")
-                except Exception: 
-                    pass
+                    async def progress(current, total):
+                        bar = get_progress_bar(current, total)
+                        try: 
+                            await status_msg.edit(f"{current_status}\n`{bar}`")
+                        except Exception: 
+                            pass
 
-            local_path = await downloader.download_media_with_progress(message, progress_callback=progress)
-            if local_path:
-                try:
-                    from telethon_utils import fast_upload
-                    await status_msg.edit(f"📤 **Uploading {category}...**")
-                    uploaded_file = await fast_upload(client, local_path, workers=4, progress_callback=progress)
-                    await status_msg.edit(f"🛰 **Finalizing Mirror...**\n`{os.path.basename(local_path)}`")
+                    local_path = await downloader.download_media_with_progress(message, progress_callback=progress)
+                    if local_path:
+                        try:
+                            from telethon_utils import fast_upload
+                            await status_msg.edit(f"📤 **Uploading {category}...** ({index}/{len(msgs)})")
+                            uploaded_file = await fast_upload(client, local_path, workers=4, progress_callback=progress)
+                            await status_msg.edit(f"🛰 **Finalizing Mirror...**\n`{os.path.basename(local_path)}`")
+                            
+                            is_voice = category == "Voices"
+                            doc_attrs = message.media.document.attributes if hasattr(message.media, 'document') else None
+                            
+                            await client.send_file(
+                                dest_entity,
+                                uploaded_file,
+                                caption=message.message,
+                                formatting_entities=message.entities,
+                                voice_note=is_voice,
+                                attributes=doc_attrs,
+                                supports_streaming=True if category == "Videos" else False
+                            )
+                            total_processed += 1
+                        except Exception as e:
+                            print(f"[ERROR] Mirroring failed: {e}")
+                        finally:
+                            if os.path.exists(local_path): os.remove(local_path)
                     
-                    is_voice = category == "Voices"
-                    doc_attrs = message.media.document.attributes if hasattr(message.media, 'document') else None
-                    
-                    await client.send_file(
-                        dest_entity,
-                        uploaded_file,
-                        caption=message.message,
-                        formatting_entities=message.entities,
-                        voice_note=is_voice,
-                        attributes=doc_attrs,
-                        supports_streaming=True if category == "Videos" else False
-                    )
-                    total_processed += 1
-                except Exception as e:
-                    print(f"[ERROR] Mirroring failed: {e}")
-                finally:
-                    if os.path.exists(local_path): os.remove(local_path)
-            
-            await asyncio.sleep(1)
+                    await asyncio.sleep(1)
     else:
-        target_categories = [state.media_type] if state.media_type != "All" else list(all_filters.keys())
+        target_categories = ["Voices", "Audios", "Videos", "Photos", "Documents"] if state.media_type == "All" else [state.media_type]
         
-        all_messages = []
+        category_messages = {cat: [] for cat in target_categories}
+        
         for category in target_categories:
             msg_filter = all_filters[category]
             current_header = f"🔄 **Siphoning {category}...**"
             if is_date_mode:
                 current_header += f" ({start_date.strftime('%Y-%m-%d')} - {end_date.strftime('%Y-%m-%d')})"
             await status_msg.edit(current_header)
-
+            
+            count = 0
             async for message in client.iter_messages(source_entity, filter=msg_filter, reverse=is_date_mode):
                 if not message.media:
                     continue
                 if not filter_by_date(message):
                     continue
-                all_messages.append(message)
                 
-                if not is_date_mode and len(all_messages) >= state.limit:
+                category_messages[category].append(message)
+                count += 1
+                
+                if not is_date_mode and count >= state.limit:
                     break
         
-        all_messages.sort(key=lambda m: m.date, reverse=False)
-        
-        for index, message in enumerate(all_messages, 1):
-            category = "Documents"
-            if message.voice: category = "Voices"
-            elif message.audio: category = "Audios"
-            elif message.video: category = "Videos"
-            elif message.photo: category = "Photos"
-            
-            current_status = f"🔄 **Mirroring...** ({index}/{len(all_messages)})"
-            await status_msg.edit(current_status)
+        for category in target_categories:
+            if category == "Photos":
+                photo_msgs = category_messages["Photos"]
+                if photo_msgs:
+                    photo_msgs.sort(key=lambda m: m.date, reverse=False)
+                    photo_count = await process_photos_with_albums(event, status_msg, dest_entity, photo_msgs)
+                    total_processed += photo_count
+            else:
+                msgs = category_messages[category]
+                msgs.sort(key=lambda m: m.date, reverse=False)
+                
+                for index, message in enumerate(msgs, 1):
+                    current_status = f"🔄 **Mirroring {category}...** ({index}/{len(msgs)})"
+                    await status_msg.edit(current_status)
 
-            async def progress(current, total):
-                bar = get_progress_bar(current, total)
-                try: 
-                    await status_msg.edit(f"{current_status}\n`{bar}`")
-                except Exception: 
-                    pass
+                    async def progress(current, total):
+                        bar = get_progress_bar(current, total)
+                        try: 
+                            await status_msg.edit(f"{current_status}\n`{bar}`")
+                        except Exception: 
+                            pass
 
-            local_path = await downloader.download_media_with_progress(message, progress_callback=progress)
-            if local_path:
-                try:
-                    from telethon_utils import fast_upload
-                    await status_msg.edit(f"📤 **Uploading...** ({index}/{len(all_messages)})")
-                    uploaded_file = await fast_upload(client, local_path, workers=4, progress_callback=progress)
-                    await status_msg.edit(f"🛰 **Finalizing Mirror...**\n`{os.path.basename(local_path)}`")
+                    local_path = await downloader.download_media_with_progress(message, progress_callback=progress)
+                    if local_path:
+                        try:
+                            from telethon_utils import fast_upload
+                            await status_msg.edit(f"📤 **Uploading {category}...** ({index}/{len(msgs)})")
+                            uploaded_file = await fast_upload(client, local_path, workers=4, progress_callback=progress)
+                            await status_msg.edit(f"🛰 **Finalizing Mirror...**\n`{os.path.basename(local_path)}`")
+                            
+                            doc_attrs = message.media.document.attributes if hasattr(message.media, 'document') else None
+                            is_voice = category == "Voices"
+                            
+                            await client.send_file(
+                                dest_entity, 
+                                uploaded_file, 
+                                caption=message.message, 
+                                formatting_entities=message.entities, 
+                                voice_note=is_voice, 
+                                attributes=doc_attrs, 
+                                supports_streaming=True if category == "Videos" else False
+                            )
+                            total_processed += 1
+                        except Exception as e:
+                            print(f"[ERROR] Siphon failed: {e}")
+                        finally:
+                            if os.path.exists(local_path): os.remove(local_path)
                     
-                    doc_attrs = message.media.document.attributes if hasattr(message.media, 'document') else None
-                    is_voice = category == "Voices"
-                    
-                    await client.send_file(
-                        dest_entity, 
-                        uploaded_file, 
-                        caption=message.message, 
-                        formatting_entities=message.entities, 
-                        voice_note=is_voice, 
-                        attributes=doc_attrs, 
-                        supports_streaming=True if category == "Videos" else False
-                    )
-                    total_processed += 1
-                except Exception as e:
-                    print(f"[ERROR] Siphon failed: {e}")
-                finally:
-                    if os.path.exists(local_path): os.remove(local_path)
-            
-            await asyncio.sleep(1)
+                    await asyncio.sleep(1)
 
     final_summary = f"🏁 **Siphon Complete!**\nTotal: `{total_processed}` mirrored to `{getattr(dest_entity, 'title', state.destination)}`."
     done_msg = await event.respond(final_summary)
